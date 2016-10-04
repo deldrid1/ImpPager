@@ -149,7 +149,7 @@ class ImpPager {
 
                       if("boot" in dataPoint.metadata && dataPoint.metadata.boot == _bootNumber){
                         local deltaTMillis = _lastTS[0] - dataPoint.ts
-                        local deltaTSeconds = deltaTMillis/1000
+                        local deltaTSeconds = math.floor(deltaTMillis+500).tointeger()/1000 //Round to nearest second, but use this int value for updating _lastTS to keep things consistent
                         dataPoint.ts = _lastTS[1] - deltaTSeconds  //All integer math, so no need to worry about decimal points
 
                         _log_debug("Calculated new ts as " + dataPoint.ts + " (deltaT = " + deltaTMillis + " ms)")
