@@ -4,7 +4,7 @@
 #require "bullwinkle.class.nut:2.3.2"
 
 const IMP_PAGER_MESSAGE_TIMEOUT = 1;
-const IMP_PAGER_RETRY_PERIOD_SEC = 0.5;
+const IMP_PAGER_RETRY_PERIOD_SEC = 0.1;
 
 const IMP_PAGER_CM_DEFAULT_SEND_TIMEOUT = 1;
 const IMP_PAGER_CM_DEFAULT_BUFFER_SIZE = 8096;
@@ -21,6 +21,9 @@ class ImpPager {
 
     // SPIFlashLogger instance
     _spiFlashLogger = null;
+
+    // Reference to the SPIFlashLogger onData next() callback function.
+    _next = null;
 
     // Message retry timer
     _retryTimer = null;
@@ -109,68 +112,84 @@ class ImpPager {
 
 
     function _retry() {
-        _log_debug("Start processing pending messages...");
-        _spiFlashLogger.read(
-            function(dataPoint, addr, next) {
-                _log_debug("Reading from SPI Flash. ID: " + dataPoint.id + " at addr: " + addr);
+        if(typeof(_next) == "function"){  // We were already in the middle of a read - continue from where we started.
+            _next(true);
+            _next = null;
+        } else {
+            _log_debug("Start processing pending messages...");
+            _spiFlashLogger.read(
+                function(dataPoint, addr, next) {
+                    _log_debug("Reading from SPI Flash. ID: " + dataPoint.id + " at addr: " + addr);
 
-                // There's no point of retrying to send pending messages when disconnected
-                if (!_connectionManager.isConnected()) {
-                    _log_debug("No connection, abort SPI Flash scanning...");
-                    // Abort scanning
-                    next(false);
-                    return;
-                }
+                    // There's no point of retrying to send pending messages when disconnected
+                    if (!_connectionManager.isConnected()) {
+                        _log_debug("No connection, abort SPI Flash scanning...");
+                        // Abort scanning
+                        next(false);
+                        return;
+                    }
 
-                if(time() == RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
-                    _log_debug("time() was invalid, abort SPI Flash scanning...");
-                    next(false);
-                    return;
-                }
+                    if(time() == RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
+                        _log_debug("time() was invalid, abort SPI Flash scanning...");
+                        next(false);
+                        return;
+                    }
 
-                // Save SPI Flash address in the message metadata
-                if(!("metadata" in dataPoint)) dataPoint.metadata <- {}
-                dataPoint.metadata.addr <- addr;
+                    // Save SPI Flash address in the message metadata
+                    if(!("metadata" in dataPoint)) dataPoint.metadata <- {}
+                    dataPoint.metadata.addr <- addr;
 
-                if("rtc" in dataPoint.metadata && dataPoint.metadata.rtc == false){
-                  if(_lastTS == null){
-                    _lastTS = [hardware.millis(), time()] //With these two datapoints, we can now re-establish all of our timestamps
-                    _log_debug("Discovered most recent datapoint saved to SPIFlash without RTC - " + dataPoint.id + " attempting to rebuild timestamps with ms = " + _lastTS[0] + " and time = " + _lastTS[1])
-                  }
+                    if("rtc" in dataPoint.metadata && dataPoint.metadata.rtc == false){
+                      if(_lastTS == null){
+                        _lastTS = [hardware.millis(), time()] //With these two datapoints, we can now re-establish all of our timestamps
+                        _log_debug("Discovered most recent datapoint saved to SPIFlash without RTC - " + dataPoint.id + " attempting to rebuild timestamps with ms = " + _lastTS[0] + " and time = " + _lastTS[1])
+                      }
 
-                  _log_debug("Found log without RTC. ID=" + dataPoint.id + " and ts=" +dataPoint.ts)
+                      _log_debug("Found log without RTC. ID=" + dataPoint.id + " and ts=" +dataPoint.ts)
 
-                  if("boot" in dataPoint.metadata && dataPoint.metadata.boot == _bootNumber){
-                    local deltaTMillis = _lastTS[0] - dataPoint.ts
-                    local deltaTSeconds = deltaTMillis/1000
-                    dataPoint.ts = _lastTS[1] - deltaTSeconds  //All integer math, so no need to worry about decimal points
+                      if("boot" in dataPoint.metadata && dataPoint.metadata.boot == _bootNumber){
+                        local deltaTMillis = _lastTS[0] - dataPoint.ts
+                        local deltaTSeconds = deltaTMillis/1000
+                        dataPoint.ts = _lastTS[1] - deltaTSeconds  //All integer math, so no need to worry about decimal points
 
-                    _log_debug("Calculated new ts as " + dataPoint.ts + "(deltaT = " + deltaTMillis + " ms)")
+                        _log_debug("Calculated new ts as " + dataPoint.ts + " (deltaT = " + deltaTMillis + " ms)")
 
-                    //update _lastTS so that we can have 25 days between datapoints instead of 25 days total of timestamps that we can rebuild
-                    _lastTS[0] -= (deltaTSeconds*1000)
-                    _lastTS[1] = dataPoint.ts
+                        //update _lastTS so that we can have 25 days between datapoints instead of 25 days total of timestamps that we can rebuild
+                        _lastTS[0] -= (deltaTSeconds*1000)
+                        _lastTS[1] = dataPoint.ts
 
-                    // Our RTC has been reset - delete the metadata
-                    delete dataPoint.metadata.rtc
+                        // Our RTC has been reset - delete the metadata
+                        delete dataPoint.metadata.rtc
+
+                        // Update the dataPoint in our SPIFlash with its proper RTC.
+                        local newAddr = _spiFlashLogger.getPosition() + _spiFlashLogger._start;
+                        delete dataPoint.metadata.addr
+                        _spiFlashLogger.write(dataPoint)
+                        dataPoint.metadata.addr <- newAddr
+                        _log_debug("Wrote data with updated RTC to addr " + newAddr +" and Deleting datapoint at addr " + addr)
+
+                        // Delete the old dataPoint without the RTC.
+                        _spiFlashLogger.erase(addr);
+
+                      } else {
+                        server.error("Warning - dataPoint bootNumber " + dpBootNum + " != device bootNumber " + _bootNumber + " for message ID " + dataPoint.id + ".  Unable to rebuild ts...")
+                      }
+                    }
 
 
+                    _resendLoggedData(dataPoint);
 
-                  } else {
-                    server.error("Warning - dataPoint bootNumber " + dpBootNum + " != device bootNumber " + _bootNumber + " for message ID " + dataPoint.id + ".  Unable to rebuild ts...")
-                  }
-                }
+                    // Don't do any further scanning until we get an ACK for already sent message
+                    _next = next
+                }.bindenv(this),
 
-                _resendLoggedData(dataPoint);
+                function() {
+                    _log_debug("Finished processing all pending messages");
+                }.bindenv(this),
 
-                // Don't do any further scanning until we get an ACK for already sent message
-                next(false);
-            }.bindenv(this),
-
-            null,
-
-            -1  // Read through the data from most recent (which is important for real-time apps) to oldest, 1 at a time.  This also allows us to rebuild our timestamps from newest to oldest
-        );
+                -1  // Read through the data from most recent (which is important for real-time apps) to oldest, 1 at a time.  This also allows us to rebuild our timestamps from newest to oldest
+            );
+        }
     }
 
     function _onConnect() {
