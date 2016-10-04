@@ -58,7 +58,7 @@ class ImpPager {
 
     function send(messageName, data = null, ts = null) {
         if(ts == null) ts = time()
-        if(_bootNumber!= null && ts == RTC_INVALID_TIME) ts = _bootNumber + "-" + hardware.millis()  //provides ms accurate delta times that can be up to 25 days (2^31ms) apart.  We use typeof(ts) == "string" to detect that our RTC has not been set in the .onFail.
+        if(_bootNumber != null && ts == RTC_INVALID_TIME) ts = _bootNumber + "-" + hardware.millis()  //provides ms accurate delta times that can be up to 25 days (2^31ms) apart.  We use typeof(ts) == "string" to detect that our RTC has not been set in the .onFail.
 
         _bullwinkle.send(messageName, data, ts)
                     .onSuccess(_onSuccess.bindenv(this))
@@ -105,6 +105,9 @@ class ImpPager {
         local package = Bullwinkle.Package(dataPoint)
             .onSuccess(_onSuccess.bindenv(this))
             .onFail(_onFail.bindenv(this));
+
+        if(dataPoint.id in _bullwinkle._packages) //Prevent overwriting of any bullwinkle packages with similair IDs
+          dataPoint.id = _bullwinkle._generateId()
 
         _bullwinkle._packages[dataPoint.id] <- package;
         _bullwinkle._sendMessage(dataPoint);
@@ -166,7 +169,7 @@ class ImpPager {
                         delete dataPoint.metadata.addr
                         _spiFlashLogger.write(dataPoint)
                         dataPoint.metadata.addr <- newAddr
-                        _log_debug("Wrote data with updated RTC to addr " + newAddr +" and Deleting datapoint at addr " + addr)
+                        _log_debug("Wrote data with updated RTC to addr " + newAddr + " and Deleting datapoint at addr " + addr)
 
                         // Delete the old dataPoint without the RTC.
                         _spiFlashLogger.erase(addr);
