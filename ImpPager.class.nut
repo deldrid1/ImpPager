@@ -9,7 +9,7 @@ const IMP_PAGER_RETRY_PERIOD_SEC = 0.0;
 const IMP_PAGER_CM_DEFAULT_SEND_TIMEOUT = 1;
 const IMP_PAGER_CM_DEFAULT_BUFFER_SIZE = 8096;
 
-const RTC_INVALID_TIME = 946684800; //Saturday 1st January 2000 12:00:00 AM UTC - this is what time() returns if the RTC signal from the imp cloud has not been received this boot.
+const IMP_PAGER_RTC_INVALID_TIME = 946684800; //Saturday 1st January 2000 12:00:00 AM UTC - this is what time() returns if the RTC signal from the imp cloud has not been received this boot.
 
 class ImpPager {
 
@@ -58,7 +58,7 @@ class ImpPager {
 
     function send(messageName, data = null, ts = null) {
         if(ts == null) ts = time()
-        if(_bootNumber != null && ts == RTC_INVALID_TIME) ts = _bootNumber + "-" + hardware.millis()  //provides ms accurate delta times that can be up to 25 days (2^31ms) apart.  We use typeof(ts) == "string" to detect that our RTC has not been set in the .onFail.
+        if(_bootNumber != null && ts == IMP_PAGER_RTC_INVALID_TIME) ts = _bootNumber + "-" + hardware.millis()  //provides ms accurate delta times that can be up to 25 days (2^31ms) apart.  We use typeof(ts) == "string" to detect that our RTC has not been set in the .onFail.
 
         _bullwinkle.send(messageName, data, ts)
                     .onSuccess(_onSuccess.bindenv(this))
@@ -132,7 +132,7 @@ class ImpPager {
                         return;
                     }
 
-                    if(time() == RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
+                    if(time() == IMP_PAGER_RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
                         _log_debug("time() was invalid, abort SPI Flash scanning...");
                         next(false);
                         return;
