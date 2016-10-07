@@ -173,14 +173,17 @@ class ImpPager {
                         delete dataPoint.metadata.rtc
 
                         // Update the dataPoint in our SPIFlash with its proper RTC.
-                        local newAddr = _spiFlashLogger.getPosition() + _spiFlashLogger._start;
-                        delete dataPoint.metadata.addr
-                        _spiFlashLogger.write(dataPoint)
-                        dataPoint.metadata.addr <- newAddr
-                        _log_debug("Wrote data with updated RTC to addr " + newAddr + " and Deleting datapoint at addr " + addr)
+                        // While this code works, its generally a bad idea unless you read the data in order from oldest to newest and assume all of your last datapoints are from the past 25 days.
+                        // Basically, you will be reading backwards from the end of SPIflash from right to left but also writing to the end of SPIFlash from left to right - if your SPIFlash is more than half full, you will overwrite old data before you process it, which generally defeats the whole purpose of impPager
+                        //TODO: BUG: What this does do is introduce some risk in terms of not updating the datapoints before a second power outage (which means that we will lose the ability to correct things) as well as some risk that our timestamps might calculate out incorrectly if the data fails the second time and our data is not within 25 days of the _lastTS value.  This should be a relatively low risk item since we will stop sending data the moment that we lose our connection but it is something to consider and that we need to write some testcases around...
+                        // local newAddr = _spiFlashLogger.getPosition() + _spiFlashLogger._start;
+                        // delete dataPoint.metadata.addr
+                        // _spiFlashLogger.write(dataPoint)
+                        // dataPoint.metadata.addr <- newAddr
+                        // _log_debug("Wrote data with updated RTC to addr " + newAddr + " and Deleting datapoint at addr " + addr)
 
-                        // Delete the old dataPoint without the RTC.
-                        _spiFlashLogger.erase(addr);
+                        // // Delete the old dataPoint without the RTC.
+                        // _spiFlashLogger.erase(addr);
 
                       } else {
                         server.error("Warning - dataPoint bootNumber " + dpBootNum + " != device bootNumber " + _bootNumber + " for message ID " + dataPoint.id + ".  Unable to rebuild ts...")
