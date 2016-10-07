@@ -130,12 +130,14 @@ class ImpPager {
                     if (!_connectionManager.isConnected()) {
                         _log_debug("No connection, abort SPI Flash scanning...");
                         // Abort scanning
+                        _next = null;
                         next(false);
                         return;
                     }
 
                     if(time() == IMP_PAGER_RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
                         _log_debug("time() was invalid, abort SPI Flash scanning...");
+                        next = null
                         next(false);
                         return;
                     }
