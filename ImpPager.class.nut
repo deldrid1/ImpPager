@@ -1,13 +1,17 @@
 #require "SPIFlashLogger.class.nut:2.1.0"
 #require "ConnectionManager.class.nut:1.0.1"
 #require "Serializer.class.nut:1.0.0"
-#require "bullwinkle.class.nut:2.3.1"
+#require "bullwinkle.class.nut:2.3.2"
 
 const IMP_PAGER_MESSAGE_TIMEOUT = 1;
-const IMP_PAGER_RETRY_PERIOD_SEC = 0.5;
+const IMP_PAGER_RETRY_PERIOD_SEC = 0.0;
 
 const IMP_PAGER_CM_DEFAULT_SEND_TIMEOUT = 1;
 const IMP_PAGER_CM_DEFAULT_BUFFER_SIZE = 8096;
+
+const IMP_PAGER_RESEND_COMPLETE = "IMP_PAGER_RESEND_COMPLETE"
+
+const IMP_PAGER_RTC_INVALID_TIME = 946684800; //Saturday 1st January 2000 12:00:00 AM UTC - this is what time() returns if the RTC signal from the imp cloud has not been received this boot.
 
 class ImpPager {
 
@@ -20,13 +24,22 @@ class ImpPager {
     // SPIFlashLogger instance
     _spiFlashLogger = null;
 
+    // Reference to the SPIFlashLogger onData next() callback function.
+    _next = null;
+
     // Message retry timer
     _retryTimer = null;
+
+    // The number of boots that this device has had - used to detect if multiple reboots without a RTC have occurred.  If bootNumber is not set, we will not attempt to recover from a lack of RTC.
+    _bootNumber = null;
+
+    // array of [lastTSmillis, lastTStimeSec] used for rebuilding timestamps for if/when we didn't have a RTC.
+    _lastTS = null;
 
     // Debug flag that controlls the debug output
     _debug = false;
 
-    constructor(connectionManager, bullwinkle = null, spiFlashLogger = null, debug = false) {
+    constructor(connectionManager, bullwinkle = null, spiFlashLogger = null, bootNumber = null, debug = false) {
         _connectionManager = connectionManager;
 
         _bullwinkle = bullwinkle ? bullwinkle : Bullwinkle({"messageTimeout" : IMP_PAGER_MESSAGE_TIMEOUT});
@@ -36,78 +49,159 @@ class ImpPager {
         _connectionManager.onConnect(_onConnect.bindenv(this));
         _connectionManager.onDisconnect(_onDisconnect.bindenv(this));
 
+        // Set the bootNumber.  If a BootNumber is provided, we will try to rebuild timestamps for conditions where we boot offline and without a RTC.  Otherwise, we won't.
+        _bootNumber = bootNumber
+
         // Schedule routine to retry sending messages
         _scheduleRetryIfConnected();
 
         _debug = debug;
     }
 
-    function send(messageName, data = null) {
-        _send(messageName, data);
+    function send(messageName, data = null, ts = null) {
+        if(ts == null) ts = time()
+        if(_bootNumber != null && ts == IMP_PAGER_RTC_INVALID_TIME) ts = _bootNumber + "-" + hardware.millis()  //provides ms accurate delta times that can be up to 25 days (2^31ms) apart.  We use typeof(ts) == "string" to detect that our RTC has not been set in the .onFail.
+
+        _bullwinkle.send(messageName, data, ts)
+                    .onSuccess(_onSuccess.bindenv(this))
+                    .onFail(_onFail.bindenv(this));
     }
 
     function _onSuccess(message) {
         // Do nothing
-        _log_debug("ACKed message name: '" + message.name + "', data: " + message.data);
+        _log_debug("ACKed message id " + message.id + " with name: '" + message.name + "' and data: " + message.data);
         if ("metadata" in message && "addr" in message.metadata && message.metadata.addr) {
             local addr = message.metadata.addr;
             _spiFlashLogger.erase(addr);
-            delete message.metadata;
             _scheduleRetryIfConnected();
         }
     }
 
     function _onFail(err, message, retry) {
-        _log_debug("Failed to deliver message name: '" + message.name + "', data: " + message.data + ", err: " + err);
+        _log_debug("Failed to deliver message id " + message.id + " with name: '" + message.name + "' and data: " + message.data + ", err: " + err);
+
         // On fail write the message to the SPI Flash for further processing
         // only if it's not already there.
         if (!("metadata" in message) || !("addr" in message.metadata) || !(message.metadata.addr)) {
+            delete message.type //Not needed to write to SPIFlash, as the type will always be BULLWINKLE_MESSAGE_TYPE.SEND
+
+            if(typeof(message.ts) == "string") {  // We have a _bootNumber and invalid RTC - add some metadata so that we can try to restore the timestamp once we have RTC.
+                message.metadata <- {
+                  "boot": split(message.ts, "-")[0].tointeger()
+                  "rtc": false
+                }
+                message.ts = split(message.ts, "-")[1].tointeger()
+            }
             _spiFlashLogger.write(message);
+            message.type <- BULLWINKLE_MESSAGE_TYPE.TIMEOUT // We are mucking around with the internal logic of Bullwinkle so we need to repair the message object here
         }
         _scheduleRetryIfConnected();
     }
 
-    function _send(messageName, data) {
-        return _bullwinkle.send(messageName, data)
+    // This is a hack to resend the message with metainformation
+    function _resendLoggedData(dataPoint) {
+        _log_debug("Resending message id " + dataPoint.id + " with name: '" + dataPoint.name + "' and data: " + dataPoint.data)
+
+        dataPoint.type <- BULLWINKLE_MESSAGE_TYPE.SEND;
+
+        local package = Bullwinkle.Package(dataPoint)
             .onSuccess(_onSuccess.bindenv(this))
             .onFail(_onFail.bindenv(this));
+
+        if(dataPoint.id in _bullwinkle._packages) //Prevent overwriting of any bullwinkle packages with similair IDs
+          dataPoint.id = _bullwinkle._generateId()
+
+        _bullwinkle._packages[dataPoint.id] <- package;
+        _bullwinkle._sendMessage(dataPoint);
     }
 
-    // This is a hack to resend the message with metainformation
-    function _resendExistingMessage(message) {
-        _log_debug("Resending message name: '" + message.name + "', message: " + message.data);
-        local package = Bullwinkle.Package(message)
-            .onSuccess(_onSuccess.bindenv(this))
-            .onFail(_onFail.bindenv(this));
-        message.ts = time();
-        message.type = BULLWINKLE_MESSAGE_TYPE.SEND;
-        _bullwinkle._packages[message.id] <- package;
-        _bullwinkle._sendMessage(message);
-    }
 
     function _retry() {
-        _log_debug("Start processing pending messages...");
-        _spiFlashLogger.read(
-            function(dataPoint, addr, next) {
-                _log_debug("Reading from the SPI Flash. Data: " + dataPoint.data + " at addr: " + addr);
+        if(typeof(_next) == "function"){  // We were already in the middle of a read - continue from where we started.
+            _next(true);
+            _next = null;
+        } else {
+            _log_debug("Start processing pending messages...");
+            _spiFlashLogger.read(
+                function(dataPoint, addr, next) {
+                    _log_debug("Reading from SPI Flash. ID: " + dataPoint.id + " at addr: " + addr);
 
-                // There's no point of retrying to send pending messages when disconnected
-                if (!_connectionManager.isConnected()) {
-                    _log_debug("No connection, abort SPI Flash scanning...");
-                    // Abort scanning
-                    next(false);
-                    return;
-                }
-                // Save SPI Flash address in the message metadata
-                dataPoint.metadata <- {"addr" : addr};
-                _resendExistingMessage(dataPoint);
-                // Don't do any further scanning until we get an ACK for already sent message
-                next(false);
-            }.bindenv(this),
-            function() {
-                _log_debug("Finished processing all pending messages");
-            }.bindenv(this)
-        );
+                    // There's no point of retrying to send pending messages when disconnected
+                    if (!_connectionManager.isConnected()) {
+                        _log_debug("No connection, abort SPI Flash scanning...");
+                        // Abort scanning
+                        _next = null;
+                        next(false);
+                        return;
+                    }
+
+                    if(time() == IMP_PAGER_RTC_INVALID_TIME){ // If time is invalid, we aren't ready to resend any data just yet...
+                        _log_debug("time() was invalid, abort SPI Flash scanning...");
+                        next = null
+                        next(false);
+                        return;
+                    }
+
+                    // Don't do any further scanning until we get an ACK for the message we are getting ready to send
+                    _next = next
+
+                    // Save SPI Flash address in the message metadata
+                    if(!("metadata" in dataPoint)) dataPoint.metadata <- {}
+                    dataPoint.metadata.addr <- addr;
+
+                    if("rtc" in dataPoint.metadata && dataPoint.metadata.rtc == false){
+                      if(_lastTS == null){
+                        _lastTS = [hardware.millis(), time()] //With these two datapoints, we can now re-establish all of our timestamps
+                        _log_debug("Discovered most recent datapoint saved to SPIFlash without RTC - " + dataPoint.id + " attempting to rebuild timestamps with ms = " + _lastTS[0] + " and time = " + _lastTS[1])
+                      }
+
+                      _log_debug("Found log without RTC. ID=" + dataPoint.id + " and ts=" +dataPoint.ts)
+
+                      if("boot" in dataPoint.metadata && dataPoint.metadata.boot == _bootNumber){
+                        local deltaTMillis = _lastTS[0] - dataPoint.ts
+                        local deltaTSeconds = math.floor((deltaTMillis+500)/1000).tointeger() //Round to nearest second, but use this int value for updating _lastTS to keep millis() and time() consistent
+                        dataPoint.ts = _lastTS[1] - deltaTSeconds  //All integer math, so no need to worry about decimal points
+
+                        _log_debug("Calculated new ts as " + dataPoint.ts + " (deltaT = " + deltaTMillis + " ms)")
+
+                        //update _lastTS so that we can have ~25 days between datapoints instead of 25 days total of timestamps that we can rebuild.
+                        //^^^ This is ~98% true.  Its actually slightly less than that since we only subtract the integer seconds (as opposed to ALL of the milliseconds) and avoid rounding problems and/or floating point precission issues associated with taking the full precision amount of millis() off of the time() stored in _lastTS.  You will have slightly a slightly smaller recovery window (losing up to 499ms), but it dramtically simplifies the code and what's half a second compared to 25 days?
+                        _lastTS[0] -= (deltaTSeconds*1000).tointeger()
+                        _lastTS[1] = dataPoint.ts
+
+                        // Our RTC has been reset - delete the metadata
+                        delete dataPoint.metadata.rtc
+
+                        // Update the dataPoint in our SPIFlash with its proper RTC.
+                        // While this code works, its generally a bad idea unless you read the data in order from oldest to newest and assume all of your last datapoints are from the past 25 days.
+                        // Basically, you will be reading backwards from the end of SPIflash from right to left but also writing to the end of SPIFlash from left to right - if your SPIFlash is more than half full, you will overwrite old data before you process it, which generally defeats the whole purpose of impPager
+                        //TODO: BUG: What this does do is introduce some risk in terms of not updating the datapoints before a second power outage (which means that we will lose the ability to correct things) as well as some risk that our timestamps might calculate out incorrectly if the data fails the second time and our data is not within 25 days of the _lastTS value.  This should be a relatively low risk item since we will stop sending data the moment that we lose our connection but it is something to consider and that we need to write some testcases around...
+                        // local newAddr = _spiFlashLogger.getPosition() + _spiFlashLogger._start;
+                        // delete dataPoint.metadata.addr
+                        // _spiFlashLogger.write(dataPoint)
+                        // dataPoint.metadata.addr <- newAddr
+                        // _log_debug("Wrote data with updated RTC to addr " + newAddr + " and Deleting datapoint at addr " + addr)
+
+                        // // Delete the old dataPoint without the RTC.
+                        // _spiFlashLogger.erase(addr);
+
+                      } else {
+                        server.error("Warning - dataPoint bootNumber " + dpBootNum + " != device bootNumber " + _bootNumber + " for message ID " + dataPoint.id + ".  Unable to rebuild ts...")
+                      }
+                    }
+
+                    _resendLoggedData(dataPoint);
+
+                }.bindenv(this),
+
+                function() {
+                    _log_debug("Finished processing all pending messages");
+                    this.send(IMP_PAGER_SPIFLASH_DUMP_COMPLETE); //Notify the agent that we are finished replaying old data in case it needs to do any special processing on replayed data (newest->oldest to oldest->newest).
+                }.bindenv(this),
+
+                -1  // Read through the data from most recent (which is important for real-time apps) to oldest, 1 at a time.  This also allows us to rebuild our timestamps from newest to oldest
+            );
+        }
     }
 
     function _onConnect() {
@@ -156,15 +250,15 @@ class ImpPager.ConnectionManager extends ConnectionManager {
     constructor(settings = {}) {
         base.constructor(settings);
 
-        // Override the timeout to make it a nonzero, but still 
-        // a small value. This is needed to avoid accedental 
+        // Override the timeout to make it a nonzero, but still
+        // a small value. This is needed to avoid accedental
         // imp disconnects when using ConnectionManager library
-        local sendTimeout = "sendTimeout" in settings ? 
+        local sendTimeout = "sendTimeout" in settings ?
             settings.sendTimeout : IMP_PAGER_CM_DEFAULT_SEND_TIMEOUT;
         server.setsendtimeoutpolicy(RETURN_ON_ERROR, WAIT_TIL_SENT, sendTimeout);
 
         // Set the recommended buffer size
-        local sendBufferSize = "sendBufferSize" in settings ? 
+        local sendBufferSize = "sendBufferSize" in settings ?
             settings.sendBufferSize : IMP_PAGER_CM_DEFAULT_BUFFER_SIZE;
         imp.setsendbuffersize(sendBufferSize);
 
@@ -209,5 +303,4 @@ class ImpPager.ConnectionManager extends ConnectionManager {
             }
         );
     }
-
 };
