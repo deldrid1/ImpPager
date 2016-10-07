@@ -9,6 +9,8 @@ const IMP_PAGER_RETRY_PERIOD_SEC = 0.0;
 const IMP_PAGER_CM_DEFAULT_SEND_TIMEOUT = 1;
 const IMP_PAGER_CM_DEFAULT_BUFFER_SIZE = 8096;
 
+const IMP_PAGER_RESEND_COMPLETE = "IMP_PAGER_RESEND_COMPLETE"
+
 const IMP_PAGER_RTC_INVALID_TIME = 946684800; //Saturday 1st January 2000 12:00:00 AM UTC - this is what time() returns if the RTC signal from the imp cloud has not been received this boot.
 
 class ImpPager {
@@ -189,6 +191,7 @@ class ImpPager {
 
                 function() {
                     _log_debug("Finished processing all pending messages");
+                    this.send(IMP_PAGER_SPIFLASH_DUMP_COMPLETE); //Notify the agent that we are finished replaying old data in case it needs to do any special processing on replayed data (newest->oldest to oldest->newest).
                 }.bindenv(this),
 
                 -1  // Read through the data from most recent (which is important for real-time apps) to oldest, 1 at a time.  This also allows us to rebuild our timestamps from newest to oldest
