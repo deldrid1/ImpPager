@@ -155,13 +155,14 @@ class ImpPager {
 
                       if("boot" in dataPoint.metadata && dataPoint.metadata.boot == _bootNumber){
                         local deltaTMillis = _lastTS[0] - dataPoint.ts
-                        local deltaTSeconds = math.floor(deltaTMillis+500).tointeger()/1000 //Round to nearest second, but use this int value for updating _lastTS to keep things consistent
+                        local deltaTSeconds = math.floor((deltaTMillis+500)/1000).tointeger() //Round to nearest second, but use this int value for updating _lastTS to keep millis() and time() consistent
                         dataPoint.ts = _lastTS[1] - deltaTSeconds  //All integer math, so no need to worry about decimal points
 
                         _log_debug("Calculated new ts as " + dataPoint.ts + " (deltaT = " + deltaTMillis + " ms)")
 
-                        //update _lastTS so that we can have 25 days between datapoints instead of 25 days total of timestamps that we can rebuild
-                        _lastTS[0] -= (deltaTSeconds*1000)
+                        //update _lastTS so that we can have ~25 days between datapoints instead of 25 days total of timestamps that we can rebuild.
+                        //^^^ This is ~98% true.  Its actually slightly less than that since we only subtract the integer seconds (as opposed to ALL of the milliseconds) and avoid rounding problems and/or floating point precission issues associated with taking the full precision amount of millis() off of the time() stored in _lastTS.  You will have slightly a slightly smaller recovery window (losing up to 499ms), but it dramtically simplifies the code and what's half a second compared to 25 days?
+                        _lastTS[0] -= (deltaTSeconds*1000).tointeger()
                         _lastTS[1] = dataPoint.ts
 
                         // Our RTC has been reset - delete the metadata
