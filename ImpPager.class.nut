@@ -138,6 +138,9 @@ class ImpPager {
                         return;
                     }
 
+                    // Don't do any further scanning until we get an ACK for the message we are getting ready to send
+                    _next = next
+
                     // Save SPI Flash address in the message metadata
                     if(!("metadata" in dataPoint)) dataPoint.metadata <- {}
                     dataPoint.metadata.addr <- addr;
@@ -179,11 +182,8 @@ class ImpPager {
                       }
                     }
 
-
                     _resendLoggedData(dataPoint);
 
-                    // Don't do any further scanning until we get an ACK for already sent message
-                    _next = next
                 }.bindenv(this),
 
                 function() {
